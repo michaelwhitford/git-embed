@@ -19,6 +19,7 @@ git embed search "market regime detection"
 
 ```bash
 git embed                          # update index for changed files
+git embed update                   # explicit form of the above
 git embed search "query"           # find similar content
 git embed similar <file>           # find files similar to this one
 git embed status                   # indexed/total, model, health
