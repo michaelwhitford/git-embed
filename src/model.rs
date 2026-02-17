@@ -25,8 +25,132 @@ pub const CHUNK_THRESHOLD: usize = 512;
 pub const PREFIX_DOCUMENT: &str = "search_document: ";
 pub const PREFIX_QUERY: &str = "search_query: ";
 
-const MAX_BATCH_TOKENS: usize = 16384;
-const MAX_BATCH_SIZE: usize = 32;
+const DEFAULT_MAX_BATCH_TOKENS: usize = 16384;
+const DEFAULT_MAX_BATCH_SIZE: usize = 32;
+
+// ---------------------------------------------------------------------------
+// Memory-aware batch sizing
+// ---------------------------------------------------------------------------
+
+/// Memory overhead per batch item during ONNX inference (empirically measured).
+/// With 512-token sequences through nomic-embed-text-v1.5:
+///   - 32 items: ~2.8 GB activation memory → ~87 MB per item
+const ACTIVATION_BYTES_PER_ITEM: usize = 90 * 1024 * 1024; // 90 MiB (conservative)
+
+/// Baseline RSS after loading the ONNX model (weights + optimized graph).
+/// Measured at ~750 MB for nomic-embed-text-v1.5 FP32 with Level3 optimization.
+const MODEL_BASELINE_BYTES: usize = 800 * 1024 * 1024; // 800 MiB (conservative)
+
+/// Minimum headroom to leave free for OS, index, and other allocations.
+const MEMORY_HEADROOM_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
+
+/// Batch configuration computed from available system memory.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchConfig {
+    pub max_batch_size: usize,
+    pub max_batch_tokens: usize,
+}
+
+impl BatchConfig {
+    /// Compute batch config from available system memory.
+    pub fn from_available_memory(available_bytes: usize) -> Self {
+        let usable = available_bytes
+            .saturating_sub(MODEL_BASELINE_BYTES)
+            .saturating_sub(MEMORY_HEADROOM_BYTES);
+
+        let max_items = if usable == 0 {
+            1
+        } else {
+            (usable / ACTIVATION_BYTES_PER_ITEM).clamp(1, DEFAULT_MAX_BATCH_SIZE)
+        };
+
+        // Scale token budget proportionally
+        let max_tokens = if max_items >= DEFAULT_MAX_BATCH_SIZE {
+            DEFAULT_MAX_BATCH_TOKENS
+        } else {
+            // At batch_size=1, we only need ~512 tokens. Scale linearly.
+            (max_items * CHUNK_THRESHOLD).max(CHUNK_THRESHOLD)
+        };
+
+        Self {
+            max_batch_size: max_items,
+            max_batch_tokens: max_tokens,
+        }
+    }
+
+    /// Default config (unconstrained, same as original hard-coded values).
+    pub fn default_config() -> Self {
+        Self {
+            max_batch_size: DEFAULT_MAX_BATCH_SIZE,
+            max_batch_tokens: DEFAULT_MAX_BATCH_TOKENS,
+        }
+    }
+
+    /// Override with explicit batch size (e.g. from --batch-size flag).
+    pub fn with_batch_size(batch_size: usize) -> Self {
+        let bs = batch_size.clamp(1, DEFAULT_MAX_BATCH_SIZE);
+        Self {
+            max_batch_size: bs,
+            max_batch_tokens: if bs >= DEFAULT_MAX_BATCH_SIZE {
+                DEFAULT_MAX_BATCH_TOKENS
+            } else {
+                (bs * CHUNK_THRESHOLD).max(CHUNK_THRESHOLD)
+            },
+        }
+    }
+
+    /// Auto-detect from system memory.
+    pub fn auto_detect() -> Self {
+        let available = available_memory_bytes();
+        let config = Self::from_available_memory(available);
+        config
+    }
+}
+
+/// Detect available system memory in bytes.
+///
+/// - macOS: `sysctl hw.memsize` for total physical memory
+/// - Linux: parse `/proc/meminfo` for `MemAvailable` (or `MemFree` fallback)
+/// - Fallback: 4 GiB assumption
+pub fn available_memory_bytes() -> usize {
+    platform_memory().unwrap_or(4 * 1024 * 1024 * 1024)
+}
+
+#[cfg(target_os = "macos")]
+fn platform_memory() -> Option<usize> {
+    use std::process::Command as StdCommand;
+    // Use sysctl to get total physical memory (most reliable on macOS)
+    let output = StdCommand::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    let s = std::str::from_utf8(&output.stdout).ok()?.trim();
+    s.parse::<usize>().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn platform_memory() -> Option<usize> {
+    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+    // Try MemAvailable first (actual available), then MemTotal as fallback
+    for key in &["MemAvailable:", "MemTotal:"] {
+        for line in contents.lines() {
+            if line.starts_with(key) {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(kb) = parts[1].parse::<usize>() {
+                        return Some(kb * 1024); // /proc/meminfo reports in kB
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn platform_memory() -> Option<usize> {
+    None
+}
 
 /// Model files to download from HuggingFace.
 const MODEL_FILES: &[(&str, &str)] = &[
@@ -109,22 +233,36 @@ pub struct EmbedModel {
     tokenizer: Tokenizer,
     /// Tokenizer without truncation for measuring true token counts.
     counting_tokenizer: Tokenizer,
+    /// Memory-aware batch configuration.
+    batch_config: BatchConfig,
 }
 
 impl EmbedModel {
     /// Load the ONNX model and tokenizers from the model directory.
     pub fn load() -> Result<Self> {
         let dir = ensure_model()?;
-        Self::load_from(&dir)
+        Self::load_from_with_threads(&dir, None, None)
+    }
+
+    /// Load with an explicit thread count and optional batch size override.
+    pub fn load_with_threads(threads: Option<usize>, batch_size: Option<usize>) -> Result<Self> {
+        let dir = ensure_model()?;
+        Self::load_from_with_threads(&dir, threads, batch_size)
     }
 
     pub fn load_from(dir: &Path) -> Result<Self> {
+        Self::load_from_with_threads(dir, None, None)
+    }
+
+    pub fn load_from_with_threads(dir: &Path, threads: Option<usize>, batch_size: Option<usize>) -> Result<Self> {
         let model_path = dir.join("model.onnx");
         let tokenizer_path = dir.join("tokenizer.json");
 
-        let cpus = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+        let cpus = threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        });
 
         let session = Session::builder()?
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
@@ -148,17 +286,30 @@ impl EmbedModel {
         let _ = counting_tokenizer.with_truncation(None);
         counting_tokenizer.with_padding(None);
 
+        // Compute memory-aware batch config
+        let batch_config = match batch_size {
+            Some(bs) => BatchConfig::with_batch_size(bs),
+            None => BatchConfig::auto_detect(),
+        };
+
         eprintln!(
-            "Loaded ONNX model: {} ({} intra-op threads)",
+            "Loaded ONNX model: {} ({} threads, batch size {})",
             model_path.display(),
-            cpus
+            cpus,
+            batch_config.max_batch_size
         );
 
         Ok(Self {
             session,
             tokenizer,
             counting_tokenizer,
+            batch_config,
         })
+    }
+
+    /// Get the current batch configuration.
+    pub fn batch_config(&self) -> BatchConfig {
+        self.batch_config
     }
 
     // --- Token counting ---
@@ -397,7 +548,7 @@ impl EmbedModel {
     }
 
     /// Group items into batches respecting token budget and max batch size.
-    fn make_batches(items: &[(usize, String, usize)]) -> Vec<Vec<usize>> {
+    fn make_batches(items: &[(usize, String, usize)], config: &BatchConfig) -> Vec<Vec<usize>> {
         // items: (original_index, prefixed_text, token_count)
         let mut sorted: Vec<(usize, usize)> = items
             .iter()
@@ -412,7 +563,7 @@ impl EmbedModel {
         for (idx, toks) in sorted {
             let projected = (current_batch.len() + 1) * toks;
             if !current_batch.is_empty()
-                && (current_batch.len() >= MAX_BATCH_SIZE || projected > MAX_BATCH_TOKENS)
+                && (current_batch.len() >= config.max_batch_size || projected > config.max_batch_tokens)
             {
                 batches.push(std::mem::take(&mut current_batch));
             }
@@ -448,7 +599,7 @@ impl EmbedModel {
             .collect();
 
         // Batch the chunks
-        let batches = Self::make_batches(&chunk_items);
+        let batches = Self::make_batches(&chunk_items, &self.batch_config);
         let mut all_embs: Vec<Option<Vec<f32>>> = vec![None; chunks.len()];
 
         for batch_indices in &batches {
@@ -525,7 +676,8 @@ impl EmbedModel {
         let mut indices: Vec<usize> = (0..all_chunks.len()).collect();
         indices.sort_by_key(|&i| all_chunks[i].tokens);
 
-        // Build batches
+        // Build batches using memory-aware config
+        let config = &self.batch_config;
         let mut batches: Vec<Vec<usize>> = Vec::new();
         let mut current_batch: Vec<usize> = Vec::new();
 
@@ -533,7 +685,7 @@ impl EmbedModel {
             let toks = all_chunks[idx].tokens;
             let projected = (current_batch.len() + 1) * toks;
             if !current_batch.is_empty()
-                && (current_batch.len() >= MAX_BATCH_SIZE || projected > MAX_BATCH_TOKENS)
+                && (current_batch.len() >= config.max_batch_size || projected > config.max_batch_tokens)
             {
                 batches.push(std::mem::take(&mut current_batch));
             }
@@ -632,10 +784,14 @@ mod tests {
 
     // --- make_batches ---
 
+    fn default_config() -> BatchConfig {
+        BatchConfig::default_config()
+    }
+
     #[test]
     fn test_make_batches_single_item() {
         let items = vec![(0, "text".to_string(), 100)];
-        let batches = EmbedModel::make_batches(&items);
+        let batches = EmbedModel::make_batches(&items, &default_config());
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].len(), 1);
     }
@@ -645,7 +801,7 @@ mod tests {
         // 3 items each 6000 tokens. Budget is 16384.
         // Batch of 2 → 2*6000=12000 ✓, batch of 3 → 3*6000=18000 ✗
         let items: Vec<_> = (0..3).map(|i| (i, format!("t{i}"), 6000)).collect();
-        let batches = EmbedModel::make_batches(&items);
+        let batches = EmbedModel::make_batches(&items, &default_config());
         assert_eq!(batches.len(), 2); // [2, 1]
     }
 
@@ -653,7 +809,7 @@ mod tests {
     fn test_make_batches_respects_max_size() {
         // 40 items with tiny tokens — should split at MAX_BATCH_SIZE (32)
         let items: Vec<_> = (0..40).map(|i| (i, format!("t{i}"), 10)).collect();
-        let batches = EmbedModel::make_batches(&items);
+        let batches = EmbedModel::make_batches(&items, &default_config());
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].len(), 32);
         assert_eq!(batches[1].len(), 8);
@@ -667,7 +823,7 @@ mod tests {
             (1, "small".to_string(), 10),
             (2, "medium".to_string(), 200),
         ];
-        let batches = EmbedModel::make_batches(&items);
+        let batches = EmbedModel::make_batches(&items, &default_config());
         // All fit in one batch (3 * 500 = 1500 < 16384)
         assert_eq!(batches.len(), 1);
         // Should be sorted: small(1), medium(2), big(0)
@@ -677,7 +833,66 @@ mod tests {
     #[test]
     fn test_make_batches_empty() {
         let items: Vec<(usize, String, usize)> = vec![];
-        let batches = EmbedModel::make_batches(&items);
+        let batches = EmbedModel::make_batches(&items, &default_config());
         assert!(batches.is_empty());
+    }
+
+    // --- BatchConfig ---
+
+    #[test]
+    fn test_batch_config_large_memory() {
+        // 16 GiB — should get full batch size
+        let config = BatchConfig::from_available_memory(16 * 1024 * 1024 * 1024);
+        assert_eq!(config.max_batch_size, 32);
+        assert_eq!(config.max_batch_tokens, DEFAULT_MAX_BATCH_TOKENS);
+    }
+
+    #[test]
+    fn test_batch_config_2gb() {
+        // 2 GiB — after 800 MiB model + 256 MiB headroom = ~992 MiB usable
+        // 992 MiB / 90 MiB per item ≈ 11
+        let config = BatchConfig::from_available_memory(2 * 1024 * 1024 * 1024);
+        assert!(config.max_batch_size >= 8 && config.max_batch_size <= 12,
+            "expected 8-12, got {}", config.max_batch_size);
+    }
+
+    #[test]
+    fn test_batch_config_1gb() {
+        // 1 GiB — very constrained
+        // After 800 MiB model + 256 MiB headroom → ~0 usable → batch_size=1
+        let config = BatchConfig::from_available_memory(1024 * 1024 * 1024);
+        assert!(config.max_batch_size <= 2,
+            "expected 1-2 for 1GB, got {}", config.max_batch_size);
+    }
+
+    #[test]
+    fn test_batch_config_explicit_override() {
+        let config = BatchConfig::with_batch_size(4);
+        assert_eq!(config.max_batch_size, 4);
+    }
+
+    #[test]
+    fn test_batch_config_clamps_to_max() {
+        let config = BatchConfig::with_batch_size(100);
+        assert_eq!(config.max_batch_size, 32);
+    }
+
+    #[test]
+    fn test_batch_config_clamps_to_min() {
+        let config = BatchConfig::with_batch_size(0);
+        assert_eq!(config.max_batch_size, 1);
+    }
+
+    #[test]
+    fn test_make_batches_with_small_config() {
+        // batch_size=2, token_budget=1024
+        let config = BatchConfig { max_batch_size: 2, max_batch_tokens: 1024 };
+        let items: Vec<_> = (0..6).map(|i| (i, format!("t{i}"), 100)).collect();
+        let batches = EmbedModel::make_batches(&items, &config);
+        // 6 items at batch_size 2 → 3 batches
+        assert_eq!(batches.len(), 3);
+        for b in &batches {
+            assert_eq!(b.len(), 2);
+        }
     }
 }

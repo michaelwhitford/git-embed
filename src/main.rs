@@ -91,6 +91,14 @@ struct Cli {
     /// Show timing breakdown after command completes
     #[arg(long, global = true)]
     time_stats: bool,
+
+    /// Number of threads for model inference (default: number of CPUs)
+    #[arg(short = 'j', long, global = true)]
+    threads: Option<usize>,
+
+    /// Max batch size for inference (default: auto-detect from available memory)
+    #[arg(short = 'b', long, global = true)]
+    batch_size: Option<usize>,
 }
 
 #[derive(Subcommand)]
@@ -296,7 +304,7 @@ fn cmd_update(repo: &git2::Repository, cli: &Cli, ts: &mut TimeStats) -> Result<
 
     eprintln!("Indexing {} new blobs", total);
     let t = Instant::now();
-    let mut model = EmbedModel::load()?;
+    let mut model = EmbedModel::load_with_threads(cli.threads, cli.batch_size)?;
     ts.model_load = t.elapsed();
 
     // Read contents, filter skippable
@@ -325,8 +333,8 @@ fn cmd_update(repo: &git2::Repository, cli: &Cli, ts: &mut TimeStats) -> Result<
         eprintln!("Skipping {} blobs (empty or >100KB)", skipped);
     }
 
-    // Process in batches of 32
-    let batch_size = 32;
+    // Process in batches sized by available memory
+    let batch_size = model.batch_config().max_batch_size;
     let total_items = contents.len();
 
     let pb = if !cli.verbose {
@@ -409,7 +417,7 @@ fn cmd_search(repo: &git2::Repository, cli: &Cli, query: &[String], ts: &mut Tim
     }
 
     let t = Instant::now();
-    let mut model = EmbedModel::load()?;
+    let mut model = EmbedModel::load_with_threads(cli.threads, cli.batch_size)?;
     ts.model_load = t.elapsed();
 
     let t = Instant::now();
