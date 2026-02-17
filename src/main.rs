@@ -2,6 +2,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::Path;
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -86,6 +87,10 @@ struct Cli {
     /// Show peak memory usage after command completes
     #[arg(long, global = true)]
     memory_stats: bool,
+
+    /// Show timing breakdown after command completes
+    #[arg(long, global = true)]
+    time_stats: bool,
 }
 
 #[derive(Subcommand)]
@@ -118,20 +123,39 @@ fn main() {
     let cli = Cli::parse();
 
     let show_mem = cli.memory_stats;
+    let show_time = cli.time_stats;
+    let wall_start = Instant::now();
+
     if show_mem {
         TRACKING.store(true, Ordering::Relaxed);
     }
 
-    if let Err(e) = run(cli) {
+    let result = run(cli);
+
+    let wall = wall_start.elapsed();
+
+    if let Err(e) = &result {
         eprintln!("Error: {:#}", e);
-        if show_mem {
-            print_memory_stats();
-        }
-        process::exit(1);
     }
 
+    if show_time {
+        // result contains the TimeStats inside Ok — but we also need it on error.
+        // Since run() returns Result<TimeStats>, we can extract it on success.
+        // On error the stats are lost, but we still print wall time.
+        match &result {
+            Ok(ts) => print_time_stats(wall, ts),
+            Err(_) => {
+                eprintln!();
+                eprintln!("Timing: {} wall (error — partial stats unavailable)", fmt_duration(wall));
+            }
+        }
+    }
     if show_mem {
         print_memory_stats();
+    }
+
+    if result.is_err() {
+        process::exit(1);
     }
 }
 
@@ -163,23 +187,79 @@ fn print_memory_stats() {
     );
 }
 
-fn run(cli: Cli) -> Result<()> {
-    let repo = git::find_repo(None)?;
+// ---------------------------------------------------------------------------
+// Time-tracking stats
+// ---------------------------------------------------------------------------
 
-    match cli.command {
-        None | Some(Command::Update) => cmd_update(&repo, &cli),
-        Some(Command::Search { ref query }) => cmd_search(&repo, &cli, query),
-        Some(Command::Similar { ref file }) => cmd_similar(&repo, &cli, file),
-        Some(Command::Status) => cmd_status(&repo),
-        Some(Command::Gc) => cmd_gc(&repo),
-        Some(Command::Clear) => cmd_clear(&repo),
-        Some(Command::Install) => cmd_install(&repo),
-        Some(Command::Uninstall) => cmd_uninstall(&repo),
+#[derive(Default)]
+struct TimeStats {
+    model_load: Duration,
+    index_load: Duration,
+    index_save: Duration,
+    embed_time: Duration,
+    embed_count: usize,
+    search_time: Duration,
+}
+
+fn fmt_duration(d: Duration) -> String {
+    let ms = d.as_secs_f64() * 1000.0;
+    if ms >= 1000.0 {
+        format!("{:.2}s", d.as_secs_f64())
+    } else if ms >= 1.0 {
+        format!("{:.1}ms", ms)
+    } else {
+        format!("{:.0}µs", ms * 1000.0)
     }
 }
 
-fn cmd_update(repo: &git2::Repository, cli: &Cli) -> Result<()> {
+fn print_time_stats(wall: Duration, ts: &TimeStats) {
+    eprintln!();
+    eprintln!("Timing: {} wall", fmt_duration(wall));
+
+    if ts.model_load > Duration::ZERO {
+        eprintln!("  model load:  {:>10}", fmt_duration(ts.model_load));
+    }
+    if ts.index_load > Duration::ZERO {
+        eprintln!("  index load:  {:>10}", fmt_duration(ts.index_load));
+    }
+    if ts.embed_count > 0 {
+        let per = ts.embed_time / ts.embed_count as u32;
+        eprintln!("  embed:       {:>10}  ({} docs, {}/doc)",
+            fmt_duration(ts.embed_time),
+            ts.embed_count,
+            fmt_duration(per),
+        );
+    }
+    if ts.search_time > Duration::ZERO {
+        eprintln!("  search:      {:>10}", fmt_duration(ts.search_time));
+    }
+    if ts.index_save > Duration::ZERO {
+        eprintln!("  index save:  {:>10}", fmt_duration(ts.index_save));
+    }
+}
+
+fn run(cli: Cli) -> Result<TimeStats> {
+    let repo = git::find_repo(None)?;
+    let mut ts = TimeStats::default();
+
+    match cli.command {
+        None | Some(Command::Update) => cmd_update(&repo, &cli, &mut ts)?,
+        Some(Command::Search { ref query }) => cmd_search(&repo, &cli, query, &mut ts)?,
+        Some(Command::Similar { ref file }) => cmd_similar(&repo, &cli, file, &mut ts)?,
+        Some(Command::Status) => cmd_status(&repo)?,
+        Some(Command::Gc) => cmd_gc(&repo)?,
+        Some(Command::Clear) => cmd_clear(&repo)?,
+        Some(Command::Install) => cmd_install(&repo)?,
+        Some(Command::Uninstall) => cmd_uninstall(&repo)?,
+    }
+
+    Ok(ts)
+}
+
+fn cmd_update(repo: &git2::Repository, cli: &Cli, ts: &mut TimeStats) -> Result<()> {
+    let t = Instant::now();
     let mut idx = index::load_index(repo)?;
+    ts.index_load = t.elapsed();
 
     let blobs = git::walk_tree(repo)?;
     let text_blobs: Vec<_> = blobs.iter().filter(|e| git::text_blob(&e.path)).collect();
@@ -215,7 +295,9 @@ fn cmd_update(repo: &git2::Repository, cli: &Cli) -> Result<()> {
     }
 
     eprintln!("Indexing {} new blobs", total);
+    let t = Instant::now();
     let mut model = EmbedModel::load()?;
+    ts.model_load = t.elapsed();
 
     // Read contents, filter skippable
     let mut contents: Vec<(String, String, String)> = Vec::new(); // (sha, path, content)
@@ -261,8 +343,12 @@ fn cmd_update(repo: &git2::Repository, cli: &Cli) -> Result<()> {
 
     for chunk in contents.chunks(batch_size) {
         let texts: Vec<&str> = chunk.iter().map(|(_, _, c)| c.as_str()).collect();
+        let batch_count = chunk.len();
+        let t = Instant::now();
         match model.embed_documents(&texts) {
             Ok(embs) => {
+                ts.embed_time += t.elapsed();
+                ts.embed_count += batch_count;
                 for (i, (sha, path, _)) in chunk.iter().enumerate() {
                     if cli.verbose {
                         println!("  ✓ {} ({})", path, sha);
@@ -271,16 +357,21 @@ fn cmd_update(repo: &git2::Repository, cli: &Cli) -> Result<()> {
                 }
             }
             Err(e) => {
+                ts.embed_time += t.elapsed();
                 eprintln!("Batch failed ({}), falling back to sequential", e);
                 for (sha, path, content) in chunk {
+                    let t2 = Instant::now();
                     match model.embed_document(content) {
                         Ok(emb) => {
+                            ts.embed_time += t2.elapsed();
+                            ts.embed_count += 1;
                             if cli.verbose {
                                 println!("  ✓ {} ({})", path, sha);
                             }
                             idx.embeddings.insert(sha.clone(), emb);
                         }
                         Err(e) => {
+                            ts.embed_time += t2.elapsed();
                             if cli.verbose {
                                 eprintln!("  ✗ {}: {}", path, e);
                             }
@@ -298,7 +389,9 @@ fn cmd_update(repo: &git2::Repository, cli: &Cli) -> Result<()> {
         pb.finish_and_clear();
     }
 
+    let t = Instant::now();
     index::save_index(repo, &idx)?;
+    ts.index_save = t.elapsed();
     println!(
         "Index updated: {} embeddings (+{}, -{})",
         idx.embeddings.len(),
@@ -309,17 +402,25 @@ fn cmd_update(repo: &git2::Repository, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn cmd_search(repo: &git2::Repository, cli: &Cli, query: &[String]) -> Result<()> {
+fn cmd_search(repo: &git2::Repository, cli: &Cli, query: &[String], ts: &mut TimeStats) -> Result<()> {
     if query.is_empty() {
         eprintln!("Usage: git embed search <query>");
         process::exit(1);
     }
 
+    let t = Instant::now();
     let mut model = EmbedModel::load()?;
+    ts.model_load = t.elapsed();
+
+    let t = Instant::now();
     let idx = index::load_index(repo)?;
+    ts.index_load = t.elapsed();
 
     let query_text = query.join(" ");
+    let t = Instant::now();
     let query_vec = model.embed_query(&query_text)?;
+    ts.embed_time = t.elapsed();
+    ts.embed_count = 1;
 
     let opts = SearchOpts {
         dims: cli.dims,
@@ -327,7 +428,10 @@ fn cmd_search(repo: &git2::Repository, cli: &Cli, query: &[String]) -> Result<()
         path: cli.path.clone(),
     };
 
+    let t = Instant::now();
     let results = search::search(repo, &idx, &query_vec, &opts);
+    ts.search_time = t.elapsed();
+
     for r in &results {
         println!("{:.4}  {}", r.score, r.path);
     }
@@ -335,8 +439,10 @@ fn cmd_search(repo: &git2::Repository, cli: &Cli, query: &[String]) -> Result<()
     Ok(())
 }
 
-fn cmd_similar(repo: &git2::Repository, cli: &Cli, file: &str) -> Result<()> {
+fn cmd_similar(repo: &git2::Repository, cli: &Cli, file: &str, ts: &mut TimeStats) -> Result<()> {
+    let t = Instant::now();
     let idx = index::load_index(repo)?;
+    ts.index_load = t.elapsed();
 
     let opts = SearchOpts {
         dims: cli.dims,
@@ -344,7 +450,10 @@ fn cmd_similar(repo: &git2::Repository, cli: &Cli, file: &str) -> Result<()> {
         path: cli.path.clone(),
     };
 
+    let t = Instant::now();
     let results = search::similar(repo, &idx, file, &opts)?;
+    ts.search_time = t.elapsed();
+
     for r in &results {
         println!("{:.4}  {}", r.score, r.path);
     }
