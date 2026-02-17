@@ -629,7 +629,6 @@ dependencies = [
  "ndarray",
  "ort",
  "rand 0.8.5",
- "rayon",
  "tempfile",
  "tokenizers",
  "ureq 2.12.1",

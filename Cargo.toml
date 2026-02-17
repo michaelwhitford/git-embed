@@ -32,7 +32,6 @@ anyhow = "1"
 log = "0.4"
 
 # Misc
-rayon = "1"
 byteorder = "1"
 
 [dev-dependencies]
