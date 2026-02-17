@@ -1,0 +1,45 @@
+[package]
+name = "git-embed"
+version = "0.1.0"
+edition = "2021"
+description = "Semantic similarity search for git repositories"
+license = "MIT"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Git
+git2 = "0.19"
+
+# ML - ONNX Runtime
+ort = { version = "2.0.0-rc.11", features = ["download-binaries", "ndarray"] }
+ndarray = "0.17"
+
+# Tokenizer (HuggingFace native Rust)
+tokenizers = { version = "0.21", features = ["http"] }
+
+# HTTP for model download
+ureq = "2"
+
+# Progress + output
+indicatif = "0.17"
+
+# Error handling
+anyhow = "1"
+
+# Logging
+log = "0.4"
+
+# Misc
+rayon = "1"
+byteorder = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
