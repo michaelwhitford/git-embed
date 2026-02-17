@@ -71,6 +71,11 @@ pub fn truncate_and_normalize(v: &[f32], dims: usize) -> Vec<f32> {
 
 // ---- Search ----
 
+/// Comparator for descending f32 scores.
+fn cmp_score_desc(a: &f32, b: &f32) -> std::cmp::Ordering {
+    b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+}
+
 /// Build a blob SHA → set-of-paths map from the repository HEAD tree.
 fn blob_sha_to_paths(repo: &Repository) -> HashMap<String, Vec<String>> {
     let entries = git::walk_tree(repo).unwrap_or_default();
@@ -81,6 +86,41 @@ fn blob_sha_to_paths(repo: &Repository) -> HashMap<String, Vec<String>> {
             .push(entry.path);
     }
     map
+}
+
+/// Select the top-k results from scored candidates using partial sort.
+///
+/// Uses `select_nth_unstable_by` (O(n)) instead of full sort (O(n log n)),
+/// then sorts only the top-k slice. Only materializes owned `SearchResult`s
+/// for the final winners — all scoring is done with borrowed references.
+pub fn top_k_results<'a>(
+    mut scored: Vec<(f32, &'a str, &'a str)>, // (score, sha, path)
+    top: usize,
+) -> Vec<SearchResult> {
+    if scored.is_empty() {
+        return Vec::new();
+    }
+
+    let k = top.min(scored.len());
+
+    if k < scored.len() {
+        // Partial sort: partition so the top-k are in scored[..k] (unordered)
+        scored.select_nth_unstable_by(k - 1, |a, b| cmp_score_desc(&a.0, &b.0));
+        scored.truncate(k);
+    }
+
+    // Sort only the top-k for final ordering
+    scored.sort_unstable_by(|a, b| cmp_score_desc(&a.0, &b.0));
+
+    // Materialize owned results only for the winners
+    scored
+        .into_iter()
+        .map(|(score, sha, path)| SearchResult {
+            score,
+            path: path.to_string(),
+            blob_sha: sha.to_string(),
+        })
+        .collect()
 }
 
 /// Search the index for vectors most similar to `query_vec`.
@@ -95,33 +135,26 @@ pub fn search(
 ) -> Vec<SearchResult> {
     let sha_paths = blob_sha_to_paths(repo);
 
-    let mut results: Vec<SearchResult> = index
+    // Score all candidates with borrowed references — no allocations per candidate
+    let scored: Vec<(f32, &str, &str)> = index
         .embeddings
         .iter()
         .flat_map(|(sha, vec)| {
             let score = cosine_similarity(query_vec, vec, opts.dims);
-            let paths = match sha_paths.get(sha) {
-                Some(p) => p.clone(),
-                None => return Vec::new(),
-            };
-            paths
+            sha_paths
+                .get(sha.as_str())
                 .into_iter()
-                .map(|path| SearchResult {
-                    score,
-                    path,
-                    blob_sha: sha.clone(),
+                .flat_map(move |paths| {
+                    paths.iter().map(move |path| (score, sha.as_str(), path.as_str()))
                 })
-                .collect::<Vec<_>>()
         })
-        .filter(|r| match &opts.path {
-            Some(prefix) => r.path.starts_with(prefix),
+        .filter(|(_, _, path)| match &opts.path {
+            Some(prefix) => path.starts_with(prefix.as_str()),
             None => true,
         })
         .collect();
 
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-    results.truncate(opts.top);
-    results
+    top_k_results(scored, opts.top)
 }
 
 /// Find files similar to the file at `file_path`.
@@ -152,35 +185,27 @@ pub fn similar(
 
     let sha_paths = blob_sha_to_paths(repo);
 
-    // Score all other embeddings against the target
-    let mut results: Vec<SearchResult> = index
+    // Score all candidates with borrowed references — no allocations per candidate
+    let scored: Vec<(f32, &str, &str)> = index
         .embeddings
         .iter()
         .filter(|(sha, _)| *sha != target_sha)
         .flat_map(|(sha, vec)| {
             let score = cosine_similarity(target_vec, vec, opts.dims);
-            let paths = match sha_paths.get(sha) {
-                Some(p) => p.clone(),
-                None => return Vec::new(),
-            };
-            paths
+            sha_paths
+                .get(sha.as_str())
                 .into_iter()
-                .map(|path| SearchResult {
-                    score,
-                    path,
-                    blob_sha: sha.clone(),
+                .flat_map(move |paths| {
+                    paths.iter().map(move |path| (score, sha.as_str(), path.as_str()))
                 })
-                .collect::<Vec<_>>()
         })
-        .filter(|r| match &opts.path {
-            Some(prefix) => r.path.starts_with(prefix),
+        .filter(|(_, _, path)| match &opts.path {
+            Some(prefix) => path.starts_with(prefix.as_str()),
             None => true,
         })
         .collect();
 
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-    results.truncate(opts.top);
-    Ok(results)
+    Ok(top_k_results(scored, opts.top))
 }
 
 #[cfg(test)]

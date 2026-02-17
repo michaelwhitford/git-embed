@@ -1,8 +1,3 @@
-mod git;
-mod index;
-mod model;
-mod search;
-
 use std::path::Path;
 use std::process;
 
@@ -10,8 +5,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::model::EmbedModel;
-use crate::search::SearchOpts;
+use git_embed::git;
+use git_embed::index;
+use git_embed::model::EmbedModel;
+use git_embed::search::{self, SearchOpts};
 
 /// Semantic similarity search for git repositories.
 #[derive(Parser)]

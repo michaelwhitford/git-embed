@@ -37,6 +37,20 @@ byteorder = "1"
 
 [dev-dependencies]
 tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+
+[[bench]]
+name = "index_serde"
+harness = false
+
+[[bench]]
+name = "search"
+harness = false
+
+[[bench]]
+name = "inference"
+harness = false
 
 [profile.release]
 opt-level = 3
