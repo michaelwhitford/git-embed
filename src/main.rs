@@ -1,5 +1,7 @@
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::Path;
 use std::process;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -9,6 +11,54 @@ use git_embed::git;
 use git_embed::index;
 use git_embed::model::EmbedModel;
 use git_embed::search::{self, SearchOpts};
+
+// ---------------------------------------------------------------------------
+// Memory-tracking allocator (near-zero overhead when enabled)
+// ---------------------------------------------------------------------------
+
+static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
+static PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
+static CURRENT_BYTES: AtomicU64 = AtomicU64::new(0);
+static TRACKING: AtomicBool = AtomicBool::new(false);
+
+struct TrackingAllocator;
+
+unsafe impl GlobalAlloc for TrackingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc(layout) };
+        if TRACKING.load(Ordering::Relaxed) && !ptr.is_null() {
+            let size = layout.size() as u64;
+            ALLOC_BYTES.fetch_add(size, Ordering::Relaxed);
+            ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+            let current = CURRENT_BYTES.fetch_add(size, Ordering::Relaxed) + size;
+            // Update peak via relaxed CAS loop
+            let mut peak = PEAK_BYTES.load(Ordering::Relaxed);
+            while current > peak {
+                match PEAK_BYTES.compare_exchange_weak(
+                    peak,
+                    current,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(p) => peak = p,
+                }
+            }
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if TRACKING.load(Ordering::Relaxed) {
+            CURRENT_BYTES.fetch_sub(layout.size() as u64, Ordering::Relaxed);
+        }
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static GLOBAL: TrackingAllocator = TrackingAllocator;
 
 /// Semantic similarity search for git repositories.
 #[derive(Parser)]
@@ -32,6 +82,10 @@ struct Cli {
     /// Verbose output during indexing
     #[arg(short, long, global = true)]
     verbose: bool,
+
+    /// Show peak memory usage after command completes
+    #[arg(long, global = true)]
+    memory_stats: bool,
 }
 
 #[derive(Subcommand)]
@@ -63,10 +117,50 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
 
+    let show_mem = cli.memory_stats;
+    if show_mem {
+        TRACKING.store(true, Ordering::Relaxed);
+    }
+
     if let Err(e) = run(cli) {
         eprintln!("Error: {:#}", e);
+        if show_mem {
+            print_memory_stats();
+        }
         process::exit(1);
     }
+
+    if show_mem {
+        print_memory_stats();
+    }
+}
+
+fn fmt_bytes(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.2} GiB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.2} MiB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn print_memory_stats() {
+    // Stop tracking before we print (avoids measuring our own output allocs)
+    TRACKING.store(false, Ordering::Relaxed);
+
+    let total = ALLOC_BYTES.load(Ordering::Relaxed);
+    let count = ALLOC_COUNT.load(Ordering::Relaxed);
+    let peak = PEAK_BYTES.load(Ordering::Relaxed);
+
+    eprintln!();
+    eprintln!("Memory: {} peak, {} total across {} allocations",
+        fmt_bytes(peak),
+        fmt_bytes(total),
+        count,
+    );
 }
 
 fn run(cli: Cli) -> Result<()> {

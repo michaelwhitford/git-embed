@@ -38,6 +38,7 @@ byteorder = "1"
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
+dhat = "0.3"
 
 [[bench]]
 name = "index_serde"
@@ -49,6 +50,10 @@ harness = false
 
 [[bench]]
 name = "inference"
+harness = false
+
+[[bench]]
+name = "memory"
 harness = false
 
 [profile.release]
